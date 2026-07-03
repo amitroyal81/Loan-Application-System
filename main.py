@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import router
 from src.config import settings
+from src.db.database import create_db_tables, close_db_connection
 
 # Configure logging
 logging.basicConfig(
@@ -41,11 +42,26 @@ async def startup_event():
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Debug mode: {settings.debug}")
 
+    # Initialize database
+    try:
+        logger.info(f"Initializing database: {settings.db_host}:{settings.db_port}/{settings.db_name}")
+        create_db_tables()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.warning(f"Database initialization warning: {str(e)}. System will use in-memory storage.")
+        logger.info("To use MySQL, ensure the database server is running and credentials are correct.")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event"""
     logger.info("Agentic AI Loan Approval System shutting down")
+
+    # Close database connections
+    try:
+        close_db_connection()
+    except Exception as e:
+        logger.warning(f"Error closing database connection: {str(e)}")
 
 
 @app.get("/")

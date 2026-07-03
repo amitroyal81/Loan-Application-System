@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
+    # Database
+    db_host: str = os.getenv("DB_HOST", "localhost")
+    db_port: int = int(os.getenv("DB_PORT", "3306"))
+    db_user: str = os.getenv("DB_USER", "admin")
+    db_password: str = os.getenv("DB_PASSWORD", "password")
+    db_name: str = os.getenv("DB_NAME", "loan_approval")
+
     # MCP Servers
     applicant_db_host: str = os.getenv("APPLICANT_DB_HOST", "localhost")
     applicant_db_port: int = int(os.getenv("APPLICANT_DB_PORT", "8001"))

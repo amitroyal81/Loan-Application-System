@@ -16,6 +16,8 @@ from src.models.schemas import (
     DecisionStatus
 )
 from src.orchestrator import LoanApprovalOrchestrator
+from src.db.database import get_db_session
+from src.db.repository import LoanApplicationRepository, LoanDecisionRepository
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ router = APIRouter(prefix="/api/v1", tags=["loan-approval"])
 # Initialize orchestrator singleton
 orchestrator = LoanApprovalOrchestrator()
 
-# In-memory application storage (replace with database in production)
+# In-memory application storage (fallback for backwards compatibility)
 application_store: Dict[str, Dict[str, Any]] = {}
 
 
@@ -45,7 +47,15 @@ async def submit_loan_application(application: LoanApplication):
         # Convert to dict for processing
         app_data = application.model_dump()
 
-        # Store application
+        # Store in database
+        db_session = get_db_session()
+        try:
+            repo = LoanApplicationRepository(db_session)
+            repo.create_application(app_data)
+        finally:
+            db_session.close()
+
+        # Also store in memory for backwards compatibility
         app_record = {
             "applicant_id": application.applicant_id,
             "status": "processing",
@@ -85,22 +95,47 @@ async def get_application_status(applicant_id: str):
         Current application status and decision (if available)
     """
     try:
-        if applicant_id not in application_store:
-            raise HTTPException(status_code=404, detail=f"Application {applicant_id} not found")
+        # Try database first
+        db_session = get_db_session()
+        try:
+            app_repo = LoanApplicationRepository(db_session)
+            app = app_repo.get_application(applicant_id)
 
-        app_record = application_store[applicant_id]
+            if app:
+                # Get decision if available
+                decision_repo = LoanDecisionRepository(db_session)
+                decision = decision_repo.get_decision(applicant_id)
+                final_decision = decision.to_dict() if decision else None
 
-        response = ApplicationStatus(
-            applicant_id=applicant_id,
-            status=DecisionStatus(app_record.get("status", "processing")),
-            risk_score=app_record.get("risk_score", 0),
-            created_at=datetime.fromisoformat(app_record.get("created_at")),
-            updated_at=datetime.fromisoformat(app_record.get("updated_at")),
-            final_decision=app_record.get("final_decision")
-        )
+                response = ApplicationStatus(
+                    applicant_id=applicant_id,
+                    status=DecisionStatus(app.status.value),
+                    risk_score=app.risk_score or 0,
+                    created_at=app.created_at,
+                    updated_at=app.updated_at,
+                    final_decision=final_decision
+                )
+                return response
+        finally:
+            db_session.close()
 
-        return response
+        # Fallback to in-memory store if not in database
+        if applicant_id in application_store:
+            app_record = application_store[applicant_id]
+            response = ApplicationStatus(
+                applicant_id=applicant_id,
+                status=DecisionStatus(app_record.get("status", "processing")),
+                risk_score=app_record.get("risk_score", 0),
+                created_at=datetime.fromisoformat(app_record.get("created_at")),
+                updated_at=datetime.fromisoformat(app_record.get("updated_at")),
+                final_decision=app_record.get("final_decision")
+            )
+            return response
 
+        raise HTTPException(status_code=404, detail=f"Application {applicant_id} not found")
+
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -120,21 +155,45 @@ async def get_loan_decision(applicant_id: str):
         Complete loan decision with explanations
     """
     try:
-        if applicant_id not in application_store:
-            raise HTTPException(status_code=404, detail=f"Application {applicant_id} not found")
+        # Try database first
+        db_session = get_db_session()
+        try:
+            app_repo = LoanApplicationRepository(db_session)
+            app = app_repo.get_application(applicant_id)
 
-        app_record = application_store[applicant_id]
+            if app:
+                if app.status.value == "processing":
+                    raise HTTPException(status_code=202, detail="Application still processing")
 
-        if app_record.get("status") == "processing":
-            raise HTTPException(status_code=202, detail="Application still processing")
+                decision_repo = LoanDecisionRepository(db_session)
+                decision = decision_repo.get_decision(applicant_id)
 
-        if not app_record.get("final_decision"):
-            raise HTTPException(status_code=404, detail="Decision not yet available")
+                if decision:
+                    return {
+                        "applicant_id": applicant_id,
+                        "decision": decision.to_dict()
+                    }
+                else:
+                    raise HTTPException(status_code=404, detail="Decision not yet available")
+        finally:
+            db_session.close()
 
-        return {
-            "applicant_id": applicant_id,
-            "decision": app_record.get("final_decision")
-        }
+        # Fallback to in-memory store
+        if applicant_id in application_store:
+            app_record = application_store[applicant_id]
+
+            if app_record.get("status") == "processing":
+                raise HTTPException(status_code=202, detail="Application still processing")
+
+            if not app_record.get("final_decision"):
+                raise HTTPException(status_code=404, detail="Decision not yet available")
+
+            return {
+                "applicant_id": applicant_id,
+                "decision": app_record.get("final_decision")
+            }
+
+        raise HTTPException(status_code=404, detail=f"Application {applicant_id} not found")
 
     except HTTPException:
         raise
@@ -169,12 +228,28 @@ async def get_metrics():
     """
     try:
         metrics = orchestrator.get_execution_metrics()
-        metrics["total_applications"] = len(application_store)
+
+        # Count applications from database
+        db_session = get_db_session()
+        try:
+            app_repo = LoanApplicationRepository(db_session)
+            metrics["total_applications"] = app_repo.get_applications_count()
+        finally:
+            db_session.close()
+
+        # Fallback to in-memory store if database count is 0
+        if metrics["total_applications"] == 0:
+            metrics["total_applications"] = len(application_store)
+
         metrics["timestamp"] = datetime.utcnow().isoformat()
         return metrics
     except Exception as e:
         logger.error(f"Error fetching metrics: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        # Fallback to in-memory count on error
+        metrics = orchestrator.get_execution_metrics()
+        metrics["total_applications"] = len(application_store)
+        metrics["timestamp"] = datetime.utcnow().isoformat()
+        return metrics
 
 
 @router.get("/applications")
@@ -187,13 +262,33 @@ async def list_applications():
     """
     try:
         applications = []
-        for app_id, app_data in application_store.items():
-            applications.append({
-                "applicant_id": app_id,
-                "status": app_data.get("status"),
-                "created_at": app_data.get("created_at"),
-                "updated_at": app_data.get("updated_at")
-            })
+
+        # Try database first
+        db_session = get_db_session()
+        try:
+            app_repo = LoanApplicationRepository(db_session)
+            db_apps = app_repo.list_all_applications(limit=1000)
+
+            for app in db_apps:
+                applications.append({
+                    "applicant_id": app.applicant_id,
+                    "status": app.status.value,
+                    "created_at": app.created_at.isoformat() if app.created_at else None,
+                    "updated_at": app.updated_at.isoformat() if app.updated_at else None
+                })
+        finally:
+            db_session.close()
+
+        # Fallback to in-memory store if database is empty
+        if not applications:
+            for app_id, app_data in application_store.items():
+                applications.append({
+                    "applicant_id": app_id,
+                    "status": app_data.get("status"),
+                    "created_at": app_data.get("created_at"),
+                    "updated_at": app_data.get("updated_at")
+                })
+
         return {
             "total": len(applications),
             "applications": applications
@@ -213,17 +308,43 @@ async def process_application_async(applicant_id: str, application_data: Dict[st
         # Process through orchestrator
         result = await orchestrator.process_loan_application(application_data)
 
-        # Update application store
-        app_record = application_store[applicant_id]
-        app_record["status"] = result.get("application_status", "completed")
-        app_record["risk_score"] = result.get("risk_score", 0)
-        app_record["final_decision"] = result
-        app_record["updated_at"] = datetime.utcnow().isoformat()
+        # Update database
+        db_session = get_db_session()
+        try:
+            app_repo = LoanApplicationRepository(db_session)
+            app_repo.update_application_decision(applicant_id, result)
 
-        logger.info(f"Application processing completed for {applicant_id}: {app_record['status']}")
+            # Save decision details
+            decision_repo = LoanDecisionRepository(db_session)
+            decision_repo.create_decision(result)
+        finally:
+            db_session.close()
+
+        # Update application store (backwards compatibility)
+        if applicant_id in application_store:
+            app_record = application_store[applicant_id]
+            app_record["status"] = result.get("application_status", "completed")
+            app_record["risk_score"] = result.get("risk_score", 0)
+            app_record["final_decision"] = result
+            app_record["updated_at"] = datetime.utcnow().isoformat()
+
+        logger.info(f"Application processing completed for {applicant_id}: {result.get('application_status', 'completed')}")
 
     except Exception as e:
         logger.error(f"Error processing application {applicant_id}: {str(e)}")
+
+        # Update database status to failed
+        try:
+            db_session = get_db_session()
+            try:
+                app_repo = LoanApplicationRepository(db_session)
+                app_repo.update_application_status(applicant_id, "failed", error=str(e))
+            finally:
+                db_session.close()
+        except Exception as db_error:
+            logger.error(f"Failed to update database with error status: {str(db_error)}")
+
+        # Update in-memory store (backwards compatibility)
         if applicant_id in application_store:
             application_store[applicant_id]["status"] = "failed"
             application_store[applicant_id]["error"] = str(e)
